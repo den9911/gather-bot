@@ -2,7 +2,7 @@ use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use std::{env, sync::{Arc, Mutex}, time::Duration};
-use teloxide::{prelude::*, types::Message};
+use teloxide::{prelude::*, types::{Message,CallbackQuery,InlineKeyboardButton,InlineKeyboardMarkup}};
 
 type Db = Arc<Mutex<Connection>>;
 
@@ -12,25 +12,25 @@ fn init_db(path: &str) -> Result<Db> {
       CREATE TABLE IF NOT EXISTS chats(chat_id INTEGER PRIMARY KEY, lang TEXT NOT NULL DEFAULT 'en');
       CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY, chat_id INTEGER NOT NULL, owner INTEGER NOT NULL, title TEXT NOT NULL, starts INTEGER NOT NULL, capacity INTEGER NOT NULL, cancelled INTEGER NOT NULL DEFAULT 0, reminded INTEGER NOT NULL DEFAULT 0);
       CREATE TABLE IF NOT EXISTS attendance(event_id INTEGER NOT NULL REFERENCES events(id), user_id INTEGER NOT NULL, name TEXT NOT NULL, joined INTEGER NOT NULL, PRIMARY KEY(event_id,user_id));")?;
+    for (column, declaration) in [("location", "TEXT NOT NULL DEFAULT ''"), ("display_time", "TEXT NOT NULL DEFAULT ''")] {
+        let found = { let mut statement=db.prepare("PRAGMA table_info(events)")?; let names=statement.query_map([], |row|row.get::<_,String>(1))?.collect::<rusqlite::Result<Vec<_>>>()?; names.iter().any(|name|name==column) };
+        if !found { db.execute(&format!("ALTER TABLE events ADD COLUMN {column} {declaration}"), [])?; }
+    }
     Ok(Arc::new(Mutex::new(db)))
 }
 fn language(db: &Connection, chat: i64) -> Result<String> {
     Ok(db.query_row("SELECT lang FROM chats WHERE chat_id=?1", [chat], |r| r.get(0)).optional()?.unwrap_or_else(|| "en".into()))
 }
 fn words(ru: bool, en: &'static str, russian: &'static str) -> &'static str { if ru { russian } else { en } }
-fn execute(db: &mut Connection, message: &Message, text: &str) -> Result<String> {
-    let chat = message.chat.id.0;
-    let sender = message.from.as_ref().ok_or_else(|| anyhow!("Anonymous messages are not supported"))?;
-    let user = i64::try_from(sender.id.0)?;
-    let name = sender.full_name();
+fn execute(db: &mut Connection, chat: i64, user: i64, name: &str, text: &str) -> Result<String> {
     let ru = language(db, chat)? == "ru";
     let mut parts = text.trim().splitn(2, ' ');
     let command = parts.next().unwrap_or("").split('@').next().unwrap_or("");
     let args = parts.next().unwrap_or("").trim();
     match command {
         "/start" | "/help" => Ok(words(ru,
-            "Gather Bot\n/create title | 2027-01-20T18:00:00+03:00 | capacity\n/list — upcoming events\n/join ID · /leave ID · /cancel ID\n/lang en or /lang ru\nThe date must include an explicit UTC offset. The bot must be running for reminders.",
-            "Gather Bot\n/create название | 2027-01-20T18:00:00+03:00 | мест\n/list — будущие встречи\n/join ID · /leave ID · /cancel ID\n/lang en или /lang ru\nУкажите дату с часовым смещением. Для напоминаний бот должен быть запущен.").into()),
+            "Gather Bot\n/create title | 2027-01-20T18:00:00+03:00 | capacity | place (optional)\n/list — upcoming events\n/join ID · /leave ID · /people ID · /cancel ID\n/lang en or /lang ru\nThe date must include an explicit UTC offset. The bot must be running for reminders.",
+            "Gather Bot\n/create название | 2027-01-20T18:00:00+03:00 | мест | место (необязательно)\n/list — будущие встречи\n/join ID · /leave ID · /people ID · /cancel ID\n/lang en или /lang ru\nУкажите дату с часовым смещением. Для напоминаний бот должен быть запущен.").into()),
         "/lang" => {
             if !["en", "ru"].contains(&args) { return Ok("Use /lang en or /lang ru".into()); }
             db.execute("INSERT INTO chats(chat_id,lang) VALUES(?1,?2) ON CONFLICT(chat_id) DO UPDATE SET lang=excluded.lang",params![chat,args])?;
@@ -38,11 +38,12 @@ fn execute(db: &mut Connection, message: &Message, text: &str) -> Result<String>
         }
         "/create" => {
             let fields: Vec<_> = args.split('|').map(str::trim).collect();
-            if fields.len()!=3 || fields[0].is_empty() || fields[0].chars().count()>120 { return Ok(words(ru,"Use /create title | date with offset | capacity","Формат: /create название | дата со смещением | количество мест").into()); }
+            if !(3..=4).contains(&fields.len()) || fields[0].is_empty() || fields[0].chars().count()>120 || fields.get(3).is_some_and(|s|s.chars().count()>200) { return Ok(words(ru,"Use /create title | date with offset | capacity","Формат: /create название | дата со смещением | количество мест").into()); }
             let date = match DateTime::parse_from_rfc3339(fields[1]) { Ok(d) if d.timestamp()>Utc::now().timestamp()=>d, _=>return Ok(words(ru,"Enter a future RFC 3339 date with offset, e.g. 2027-01-20T18:00:00+03:00","Укажите будущую дату со смещением: 2027-01-20T18:00:00+03:00").into()) };
             let capacity: i64 = match fields[2].parse() { Ok(n) if (1..=1000).contains(&n)=>n, _=>return Ok(words(ru,"Capacity must be between 1 and 1000.","Количество мест: от 1 до 1000.").into()) };
-            db.execute("INSERT INTO events(chat_id,owner,title,starts,capacity) VALUES(?1,?2,?3,?4,?5)",params![chat,user,fields[0],date.timestamp(),capacity])?;
-            Ok(format!("{} #{}: {} — {} UTC\n/join {}",words(ru,"Created","Создана встреча"),db.last_insert_rowid(),fields[0],date.with_timezone(&Utc).format("%Y-%m-%d %H:%M"),db.last_insert_rowid()))
+            let location=fields.get(3).copied().unwrap_or("");
+            db.execute("INSERT INTO events(chat_id,owner,title,starts,capacity,location,display_time) VALUES(?1,?2,?3,?4,?5,?6,?7)",params![chat,user,fields[0],date.timestamp(),capacity,location,date.to_rfc3339()])?;
+            Ok(format!("{} #{}: {}\n{}{}\n/join {} · /people {}",words(ru,"Created","Создана встреча"),db.last_insert_rowid(),fields[0],date.format("%Y-%m-%d %H:%M %:z"),if location.is_empty(){String::new()}else{format!("\n📍 {location}")},db.last_insert_rowid(),db.last_insert_rowid()))
         }
         "/list" => {
             let mut statement=db.prepare("SELECT id,title,starts,capacity,(SELECT COUNT(*) FROM attendance a WHERE a.event_id=e.id) FROM events e WHERE chat_id=?1 AND cancelled=0 AND starts>?2 ORDER BY starts LIMIT 20")?;
@@ -50,6 +51,16 @@ fn execute(db: &mut Connection, message: &Message, text: &str) -> Result<String>
             let mut result=String::new();
             for row in rows { let (id,title,starts,cap,count)=row?; let date=DateTime::from_timestamp(starts,0).map(|d|d.format("%Y-%m-%d %H:%M UTC").to_string()).unwrap_or_default(); result.push_str(&format!("#{id} {title}\n{date} · {}/{} (+{} waitlist)\n/join {id} · /leave {id}\n\n", count.min(cap), cap, (count-cap).max(0))); }
             if result.is_empty(){result=words(ru,"No upcoming events.","Предстоящих встреч нет.").into();} Ok(result)
+        }
+        "/people" => {
+            let id:i64=match args.parse(){Ok(n) if n>0=>n,_=>return Ok(words(ru,"Enter an event ID.","Укажите номер встречи.").into())};
+            let event:Option<(String,i64)>=db.query_row("SELECT title,capacity FROM events WHERE id=?1 AND chat_id=?2 AND cancelled=0",params![id,chat],|r|Ok((r.get(0)?,r.get(1)?))).optional()?;
+            let Some((title,capacity))=event else{return Ok(words(ru,"Event not found in this chat.","Встреча в этом чате не найдена.").into())};
+            let mut statement=db.prepare("SELECT name FROM attendance WHERE event_id=?1 ORDER BY joined,user_id LIMIT 50")?;
+            let names=statement.query_map([id],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            let mut output=format!("#{} {}\n",id,title);
+            for (i,name) in names.iter().enumerate(){output.push_str(&format!("{} {}\n",if (i as i64)<capacity{"✓"}else{"⏳"},name.chars().take(60).collect::<String>()));}
+            if names.is_empty(){output.push_str(words(ru,"No participants yet.","Пока никто не записался."));} Ok(output)
         }
         "/join" | "/leave" | "/cancel" => {
             let id:i64=match args.parse(){Ok(n) if n>0=>n,_=>return Ok(words(ru,"Enter an event ID.","Укажите номер встречи.").into())};
@@ -93,14 +104,48 @@ async fn reminders(bot: Bot, db: Db) {
         }
     }
 }
+fn keyboard(id:i64,ru:bool)->InlineKeyboardMarkup {
+    InlineKeyboardMarkup::new(vec![vec![
+        InlineKeyboardButton::callback(words(ru,"✓ Join","✓ Пойду"),format!("join:{id}")),
+        InlineKeyboardButton::callback(words(ru,"Leave","Не смогу"),format!("leave:{id}")),
+        InlineKeyboardButton::callback(words(ru,"People","Участники"),format!("people:{id}"))
+    ]])
+}
+async fn message_handler(bot:Bot,msg:Message,db:Db)->ResponseResult<()> {
+    let Some(text)=msg.text() else{return respond(())};let Some(sender)=msg.from.as_ref() else{return respond(())};
+    let chat=msg.chat.id.0;let user=match i64::try_from(sender.id.0){Ok(id)=>id,Err(_)=>return respond(())};
+    let response=match db.lock(){Ok(mut conn)=>{let before=conn.last_insert_rowid();let result=execute(&mut conn,chat,user,&sender.full_name(),text);let created=if text.split_whitespace().next().unwrap_or("").split('@').next()==Some("/create") && conn.last_insert_rowid()!=before && result.is_ok(){Some((conn.last_insert_rowid(),language(&conn,chat).unwrap_or_default()=="ru"))}else{None};result.map(|text|(text,created))},Err(_)=>Err(anyhow!("database lock poisoned"))};
+    match response {Ok((text,Some((id,ru)))) if !text.is_empty()=>{bot.send_message(msg.chat.id,text).reply_markup(keyboard(id,ru)).await?;},Ok((text,_)) if !text.is_empty()=>{bot.send_message(msg.chat.id,text).await?;},Err(e)=>{eprintln!("request error: {e:#}");bot.send_message(msg.chat.id,"Could not process this request. / Не удалось выполнить запрос.").await?;},_=>{}} respond(())
+}
+async fn callback_handler(bot:Bot,q:CallbackQuery,db:Db)->ResponseResult<()> {
+    let answer=if let (Some(message),Some(data))=(q.regular_message(),q.data.as_deref()){
+        let mut parts=data.split(':');let action=parts.next().unwrap_or("");let id=parts.next().and_then(|s|s.parse::<i64>().ok());
+        if parts.next().is_none() && matches!(action,"join"|"leave"|"people") && id.is_some_and(|n|n>0){
+            let chat=message.chat.id.0;let user=i64::try_from(q.from.id.0).unwrap_or(0);let command=format!("/{action} {}",id.unwrap_or_default());
+            match db.lock(){Ok(mut conn)=>execute(&mut conn,chat,user,&q.from.full_name(),&command).unwrap_or_else(|e|{eprintln!("callback error: {e:#}");"Request failed / Ошибка запроса".into()}),Err(_)=>"Request failed / Ошибка запроса".into()}
+        }else{"Invalid action / Неверное действие".into()}
+    }else{"Message unavailable / Сообщение недоступно".into()};
+    let short=answer.chars().take(190).collect::<String>();bot.answer_callback_query(q.id).text(short).show_alert(true).await?;respond(())
+}
 #[tokio::main]
 async fn main() -> Result<()> {
     let token=env::var("TELOXIDE_TOKEN").context("Set TELOXIDE_TOKEN to your Telegram bot token")?;
     let db=init_db(&env::var("GATHER_DB").unwrap_or_else(|_| "gather.sqlite".into()))?;
     let bot=Bot::new(token);tokio::spawn(reminders(bot.clone(),db.clone()));
-    teloxide::repl(bot, move |bot:Bot,msg:Message| { let db=db.clone(); async move {
-        let response = if let Some(text)=msg.text() {match db.lock(){Ok(mut conn)=>execute(&mut conn,&msg,text),Err(_)=>Err(anyhow!("database lock poisoned"))}} else {Ok(String::new())};
-        match response {Ok(text) if !text.is_empty()=>{bot.send_message(msg.chat.id,text).await?;},Err(e)=>{eprintln!("request error: {e:#}");bot.send_message(msg.chat.id,"Could not process this request. / Не удалось выполнить запрос.").await?;},_=>{}}
-        respond(())
-    }}).await; Ok(())
+    let handler=teloxide::dptree::entry().branch(Update::filter_message().endpoint(message_handler)).branch(Update::filter_callback_query().endpoint(callback_handler));
+    Dispatcher::builder(bot,handler).dependencies(teloxide::dptree::deps![db]).enable_ctrlc_handler().build().dispatch().await;Ok(())
+}
+#[cfg(test)]
+mod tests {
+ use super::*;
+ #[test] fn meetup_waitlist_and_chat_scope()->Result<()> {
+  let db=init_db(":memory:")?;let mut db=db.lock().map_err(|_|anyhow!("lock"))?;
+  let date=(Utc::now()+chrono::Duration::days(2)).to_rfc3339();let text=format!("/create Dinner | {date} | 1 | Cafe");execute(&mut db,1,11,"Alice",&text)?;
+  let id=db.last_insert_rowid();assert!(execute(&mut db,1,11,"Alice",&format!("/join {id}"))?.contains("attending"));
+  assert!(execute(&mut db,1,22,"Bob",&format!("/join {id}"))?.contains("Waitlist"));
+  assert!(execute(&mut db,2,22,"Bob",&format!("/join {id}"))?.contains("not found"));
+  assert!(execute(&mut db,1,11,"Alice",&format!("/leave {id}"))?.contains("Bob"));
+  assert!(execute(&mut db,1,22,"Bob",&format!("/cancel {id}"))?.contains("organizer"));
+  execute(&mut db,1,11,"Alice",&format!("/cancel {id}"))?;assert!(execute(&mut db,1,22,"Bob",&format!("/join {id}"))?.contains("not found")); Ok(())
+ }
 }
