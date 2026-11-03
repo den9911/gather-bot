@@ -1,3 +1,5 @@
+mod calendar;
+mod startup;
 use anyhow::{anyhow, Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
@@ -12,6 +14,7 @@ fn init_db(path: &str) -> Result<Db> {
       CREATE TABLE IF NOT EXISTS chats(chat_id INTEGER PRIMARY KEY, lang TEXT NOT NULL DEFAULT 'en');
       CREATE TABLE IF NOT EXISTS events(id INTEGER PRIMARY KEY, chat_id INTEGER NOT NULL, owner INTEGER NOT NULL, title TEXT NOT NULL, starts INTEGER NOT NULL, capacity INTEGER NOT NULL, cancelled INTEGER NOT NULL DEFAULT 0, reminded INTEGER NOT NULL DEFAULT 0);
       CREATE TABLE IF NOT EXISTS attendance(event_id INTEGER NOT NULL REFERENCES events(id), user_id INTEGER NOT NULL, name TEXT NOT NULL, joined INTEGER NOT NULL, PRIMARY KEY(event_id,user_id));")?;
+    db.execute_batch("CREATE TABLE IF NOT EXISTS app_meta(key TEXT PRIMARY KEY,value TEXT NOT NULL); INSERT OR IGNORE INTO app_meta(key,value) VALUES('instance',lower(hex(randomblob(16))))")?;
     for (column, declaration) in [("location", "TEXT NOT NULL DEFAULT ''"), ("display_time", "TEXT NOT NULL DEFAULT ''")] {
         let found = { let mut statement=db.prepare("PRAGMA table_info(events)")?; let names=statement.query_map([], |row|row.get::<_,String>(1))?.collect::<rusqlite::Result<Vec<_>>>()?; names.iter().any(|name|name==column) };
         if !found { db.execute(&format!("ALTER TABLE events ADD COLUMN {column} {declaration}"), [])?; }
@@ -29,8 +32,8 @@ fn execute(db: &mut Connection, chat: i64, user: i64, name: &str, text: &str) ->
     let args = parts.next().unwrap_or("").trim();
     match command {
         "/start" | "/help" => Ok(words(ru,
-            "Gather Bot\n/create title | 2027-01-20T18:00:00+03:00 | capacity | place (optional)\n/list — upcoming events\n/join ID · /leave ID · /people ID · /cancel ID\n/lang en or /lang ru\nThe date must include an explicit UTC offset. The bot must be running for reminders.",
-            "Gather Bot\n/create название | 2027-01-20T18:00:00+03:00 | мест | место (необязательно)\n/list — будущие встречи\n/join ID · /leave ID · /people ID · /cancel ID\n/lang en или /lang ru\nУкажите дату с часовым смещением. Для напоминаний бот должен быть запущен.").into()),
+            "Gather Bot\n/create title | 2027-01-20T18:00:00+03:00 | capacity | place (optional)\n/list — upcoming events\n/join ID · /leave ID · /people ID · /cancel ID\n/calendar ID — calendar file\n/lang en or /lang ru\nThe date must include an explicit UTC offset. The bot must be running for reminders.",
+            "Gather Bot\n/create название | 2027-01-20T18:00:00+03:00 | мест | место (необязательно)\n/list — будущие встречи\n/join ID · /leave ID · /people ID · /cancel ID\n/calendar ID — файл календаря\n/lang en или /lang ru\nУкажите дату с часовым смещением. Для напоминаний бот должен быть запущен.").into()),
         "/lang" => {
             if !["en", "ru"].contains(&args) { return Ok("Use /lang en or /lang ru".into()); }
             db.execute("INSERT INTO chats(chat_id,lang) VALUES(?1,?2) ON CONFLICT(chat_id) DO UPDATE SET lang=excluded.lang",params![chat,args])?;
@@ -113,6 +116,11 @@ fn keyboard(id:i64,ru:bool)->InlineKeyboardMarkup {
 }
 async fn message_handler(bot:Bot,msg:Message,db:Db)->ResponseResult<()> {
     let Some(text)=msg.text() else{return respond(())};let Some(sender)=msg.from.as_ref() else{return respond(())};
+    if text.split_whitespace().next().unwrap_or("").split('@').next()==Some("/calendar") {
+      let id=text.split_whitespace().nth(1).and_then(|v|v.parse::<i64>().ok()).filter(|n|*n>0);
+      let result=match id {Some(id)=>match db.lock(){Ok(conn)=>calendar::export(&conn,msg.chat.id.0,id),Err(_)=>Err(anyhow!("database lock poisoned"))},None=>Ok(None)};
+      match result {Ok(Some(bytes))=>{bot.send_document(msg.chat.id,teloxide::types::InputFile::memory(bytes).file_name("gather-event.ics")).caption("Calendar snapshot, not a subscription / Снимок события, не подписка").await?;},_=>{bot.send_message(msg.chat.id,"Event unavailable in this chat. Use /calendar ID. / Встреча недоступна в этом чате. /calendar ID").await?;}}return respond(());
+    }
     let chat=msg.chat.id.0;let user=match i64::try_from(sender.id.0){Ok(id)=>id,Err(_)=>return respond(())};
     let response=match db.lock(){Ok(mut conn)=>{let before:i64=conn.query_row("SELECT COALESCE(MAX(id),0) FROM events",[],|row|row.get(0)).unwrap_or(0);let result=execute(&mut conn,chat,user,&sender.full_name(),text);let created=if text.split_whitespace().next().unwrap_or("").split('@').next()==Some("/create") && conn.last_insert_rowid()!=before && result.is_ok(){Some((conn.last_insert_rowid(),language(&conn,chat).unwrap_or_default()=="ru"))}else{None};result.map(|text|(text,created))},Err(_)=>Err(anyhow!("database lock poisoned"))};
     match response {Ok((text,Some((id,ru)))) if !text.is_empty()=>{bot.send_message(msg.chat.id,text).reply_markup(keyboard(id,ru)).await?;},Ok((text,_)) if !text.is_empty()=>{bot.send_message(msg.chat.id,text).await?;},Err(e)=>{eprintln!("request error: {e:#}");bot.send_message(msg.chat.id,"Could not process this request. / Не удалось выполнить запрос.").await?;},_=>{}} respond(())
@@ -129,6 +137,10 @@ async fn callback_handler(bot:Bot,q:CallbackQuery,db:Db)->ResponseResult<()> {
 }
 #[tokio::main]
 async fn main() -> Result<()> {
+    if std::env::args().any(|a|a=="--check") {
+      anyhow::ensure!(env::var("TELOXIDE_TOKEN").is_ok_and(|v|!v.trim().is_empty()),"Set TELOXIDE_TOKEN / Задайте TELOXIDE_TOKEN");
+      return startup::check(Some(std::path::Path::new(&env::var("GATHER_DB").unwrap_or_else(|_|"gather.sqlite".into()))),None);
+    }
     let token=env::var("TELOXIDE_TOKEN").context("Set TELOXIDE_TOKEN to your Telegram bot token")?;
     let db=init_db(&env::var("GATHER_DB").unwrap_or_else(|_| "gather.sqlite".into()))?;
     let bot=Bot::new(token);tokio::spawn(reminders(bot.clone(),db.clone()));
@@ -148,4 +160,8 @@ mod tests {
   assert!(execute(&mut db,1,22,"Bob",&format!("/cancel {id}"))?.contains("organizer"));
   execute(&mut db,1,11,"Alice",&format!("/cancel {id}"))?;assert!(execute(&mut db,1,22,"Bob",&format!("/join {id}"))?.contains("not found")); Ok(())
  }
+}
+
+#[cfg(test)]mod calendar_tests{use super::*;
+ #[test]fn calendar_scopes_cancel_and_stable_uid()->Result<()>{let db=init_db(":memory:")?;let mut c=db.lock().map_err(|_|anyhow!("lock"))?;let date=(Utc::now()+chrono::Duration::days(1)).to_rfc3339();execute(&mut c,1,5,"Name",&format!("/create Привет, мир | {date} | 2 | Cafe"))?;let id=c.last_insert_rowid();let a=calendar::export(&c,1,id)?.context("file")?;let b=calendar::export(&c,1,id)?.context("file")?;let uid=|v:Vec<u8>|String::from_utf8_lossy(&v).lines().find(|l|l.starts_with("UID:")).unwrap_or("").to_owned();assert_eq!(uid(a),uid(b));assert!(calendar::export(&c,2,id)?.is_none());execute(&mut c,1,5,"Name",&format!("/cancel {id}"))?;assert!(calendar::export(&c,1,id)?.is_none());Ok(())}
 }

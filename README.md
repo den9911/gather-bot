@@ -39,3 +39,11 @@ New event confirmations show the supplied UTC offset; the event list is displaye
 Пример: `/create Настольные игры | 2027-01-20T18:00:00+03:00 | 8`. Команды `/list`, `/join 1`, `/leave 1`, `/people 1`, `/cancel 1` управляют встречами. Язык чата: `/lang ru` или `/lang en`.
 
 Дата вводится со смещением относительно UTC. Подтверждение показывает это смещение; список встреч — UTC. Файл данных — `gather.sqlite` либо путь из `GATHER_DB`; сохраняйте его копию, когда бот остановлен. Для напоминаний бот должен работать. После сбоя напоминание может повториться. Оформление Telegram определяется самим приложением Telegram.
+
+### Calendar export / Экспорт в календарь
+
+Use `/calendar ID` in the event's chat to download a UTF-8 iCalendar snapshot with the title, UTC start and location. The UID is stable within this bot database; cancelled events and other chats cannot be exported. It is a one-time snapshot, not a subscription, and contains no participant list. No duration is invented.
+
+Команда `/calendar ID` выдаёт снимок встречи в `.ics`: название, начало UTC и место. ID стабилен в этой базе; отменённая встреча и чужой чат недоступны. Это не подписка; список участников не экспортируется.
+
+Run `cargo run --release -- --check` for startup diagnostics without starting Telegram; set `TELOXIDE_TOKEN` first. Launchers forward `--check`. Tokens are not printed. / Проверка запуска: `cargo run --release -- --check`, без подключения к Telegram.
