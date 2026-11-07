@@ -12,7 +12,7 @@ A small Telegram bot for arranging meetups: create an event, gather RSVPs and ke
 
 1. Install [Rust and Cargo](https://rustup.rs/). Create a bot using [@BotFather](https://t.me/BotFather) and obtain its token.
 2. Set `TELOXIDE_TOKEN` in your terminal. On macOS: `export TELOXIDE_TOKEN='your-token'`; on Windows Command Prompt: `set TELOXIDE_TOKEN=your-token`. Do not commit the token.
-3. Run `cargo run --release`, or use `run.bat` on Windows or `sh run.command` on macOS in the same terminal. The first run downloads dependencies. The bot uses long polling; run only one instance per token.
+3. Check setup with `cargo run --release -- --check` (no Telegram connection), then run `cargo run --release`, or use `run.bat` on Windows or `sh run.command` on macOS in the same terminal. The first run downloads dependencies. The bot uses long polling; run only one instance per token.
 4. Open the bot in Telegram or add it to a group. Use commands addressed to the bot (for example, `/help@YourBot`).
 
 `GATHER_DB` optionally sets the SQLite file path; default: `gather.sqlite` in the working directory. Keep this file private and back it up when the bot is stopped. The computer must be running for reminders.
@@ -33,7 +33,7 @@ New event confirmations show the supplied UTC offset; the event list is displaye
 
 1. Установите [Rust и Cargo](https://rustup.rs/), создайте бота через [@BotFather](https://t.me/BotFather) и получите токен.
 2. В терминале macOS задайте `export TELOXIDE_TOKEN='ваш-токен'`; в командной строке Windows — `set TELOXIDE_TOKEN=ваш-токен`. Не публикуйте токен.
-3. В том же терминале выполните `cargo run --release`, либо `sh run.command` на macOS или `run.bat` на Windows. Для первой сборки нужны интернет и зависимости. Запускайте только один экземпляр с этим токеном.
+3. В том же терминале сначала проверьте настройки: `cargo run --release -- --check` (без подключения к Telegram), затем выполните `cargo run --release`, либо `sh run.command` на macOS или `run.bat` на Windows. Для первой сборки нужны интернет и зависимости. Запускайте только один экземпляр с этим токеном.
 4. Откройте бота в Telegram или добавьте в группу. Используйте команды, адресованные боту: например, `/help@YourBot`.
 
 Пример: `/create Настольные игры | 2027-01-20T18:00:00+03:00 | 8`. Команды `/list`, `/join 1`, `/leave 1`, `/people 1`, `/cancel 1` управляют встречами. Язык чата: `/lang ru` или `/lang en`.
@@ -47,3 +47,13 @@ Use `/calendar ID` in the event's chat to download a UTF-8 iCalendar snapshot wi
 Команда `/calendar ID` выдаёт снимок встречи в `.ics`: название, начало UTC и место. ID стабилен в этой базе; отменённая встреча и чужой чат недоступны. Это не подписка; список участников не экспортируется.
 
 Run `cargo run --release -- --check` for startup diagnostics without starting Telegram; set `TELOXIDE_TOKEN` first. Launchers forward `--check`. Tokens are not printed. / Проверка запуска: `cargo run --release -- --check`, без подключения к Telegram.
+
+### Reliable command replies / Надёжные ответы команд
+
+Only a committed create result includes an event ID and inline controls. Invalid or failed commands never inherit buttons from another SQLite insert. Redelivery of the original Telegram message reuses its stored event; changing that message's create payload is rejected. A new message ID is a new request: check `/list` before sending a fresh command when the previous result is unclear. Deleting event data also deletes its deduplication record. Reminder delivery retains its earlier crash limitations.
+
+ID и кнопки появляются только в результате успешно сохранённой встречи. Ошибочная команда не получает кнопки от посторонней SQLite-записи. Повторная доставка исходного сообщения Telegram возвращает существующую встречу; изменённая заявка с тем же ID отклоняется. Новое сообщение — новая заявка: при неизвестном результате сначала проверьте `/list`. Удаление данных встречи удаляет и защиту от её повтора. Ограничения напоминаний после сбоя остаются прежними.
+
+Long replies are split within a 3500 UTF-16-unit budget, up to four parts; extreme legacy data is explicitly marked as truncated. The People button opens a short acknowledgement followed by the full bounded reply. Input commands are limited to 4096 UTF-16 units and callbacks to 64 bytes. Telegram supplies its own appearance; no separate web theme controls are invented.
+
+Длинные ответы разбиваются на части до 3500 UTF-16 единиц, максимум четыре; чрезмерный старый результат помечается как сокращённый. Кнопка «Участники» даёт короткое подтверждение и полный ограниченный ответ отдельными сообщениями. Команда ограничена 4096 UTF-16 единицами, callback — 64 байтами. Оформлением управляет Telegram.

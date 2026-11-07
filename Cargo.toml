@@ -10,3 +10,7 @@ chrono = "0.4"
 rusqlite = { version = "0.32", features = ["bundled"] }
 teloxide = { version = "0.17", features = ["ctrlc_handler", "rustls"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "signal"] }
+sha2 = "0.10"
+
+[dev-dependencies]
+tempfile = "3"
