@@ -7,78 +7,243 @@ use sha2::{Digest, Sha256};
 pub enum CommandOutcome {
     Ignored,
     Reply(String),
-    Created { event_id:i64, ru:bool, text:String },
+    Created {
+        event_id: i64,
+        ru: bool,
+        text: String,
+    },
 }
 impl CommandOutcome {
     pub fn text(&self) -> &str {
-        match self { Self::Ignored=>"", Self::Reply(text)|Self::Created{text,..}=>text }
-    }
-    pub fn created(&self) -> Option<(i64,bool)> {
-        match self { Self::Created{event_id,ru,..}=>Some((*event_id,*ru)), _=>None }
-    }
-}
-pub fn valid_input(text:&str) -> bool { text.encode_utf16().take(4097).count()<=4096 }
-fn command_parts(text:&str) -> (&str,&str) {
-    let mut parts=text.trim().splitn(2,char::is_whitespace);
-    (parts.next().unwrap_or("").split('@').next().unwrap_or(""),parts.next().unwrap_or("").trim())
-}
-pub fn execute(db:&mut Connection,chat:i64,user:i64,name:&str,text:&str)->Result<CommandOutcome> {
-    execute_message(db,chat,user,name,text,None)
-}
-pub fn execute_message(db:&mut Connection,chat:i64,user:i64,name:&str,text:&str,message_id:Option<i32>)->Result<CommandOutcome> {
-    if !valid_input(text) { return Ok(CommandOutcome::Reply("Command is too long / Слишком длинная команда".into())); }
-    if text.trim().is_empty() { return Ok(CommandOutcome::Ignored); }
-    if user<=0 { return Ok(CommandOutcome::Reply("Sender unavailable / Отправитель недоступен".into())); }
-    let (command,args)=command_parts(text);
-    if command=="/create" {
-        let ru=language(db,chat)?=="ru";
-        let fingerprint=Sha256::digest(text.trim().as_bytes()).to_vec();
-        return create(db,chat,user,args,message_id,&fingerprint,ru);
-    }
-    let bounded_name=name.chars().take(60).collect::<String>();
-    let reply=execute_text(db,chat,user,&bounded_name,text)?;
-    Ok(if reply.is_empty(){CommandOutcome::Ignored}else{CommandOutcome::Reply(reply)})
-}
-struct CreatedRow {
-    id:i64, owner:i64, title:String, display_time:String, location:String,
-    starts:i64, cancelled:bool, fingerprint:Vec<u8>,
-}
-fn creation_outcome(row:&CreatedRow,ru:bool,replayed:bool)->Result<CommandOutcome> {
-    if replayed && (row.cancelled || row.starts<=Utc::now().timestamp()) {
-        return Ok(CommandOutcome::Reply(format!("{} #{}; {}",words(ru,"Already created","Уже создана встреча"),row.id,words(ru,"this event is no longer open.","эта встреча больше не открыта."))));
-    }
-    let date=DateTime::parse_from_rfc3339(&row.display_time).context("Invalid saved creation time")?;
-    let heading=if replayed {words(ru,"Already created","Уже создана встреча")} else {words(ru,"Created","Создана встреча")};
-    Ok(CommandOutcome::Created {event_id:row.id,ru,text:format!("{} #{}: {}\n{}{}\n/join {} · /people {}",heading,row.id,row.title,date.format("%Y-%m-%d %H:%M %:z"),if row.location.is_empty(){String::new()}else{format!("\n📍 {}",row.location)},row.id,row.id)})
-}
-fn create(db:&mut Connection,chat:i64,user:i64,args:&str,message_id:Option<i32>,fingerprint:&[u8],ru:bool)->Result<CommandOutcome> {
-    if message_id.is_some_and(|id|id<=0) { return Ok(CommandOutcome::Reply("Message identifier unavailable / Номер сообщения недоступен".into())); }
-    let tx=db.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    if let Some(message_id)=message_id {
-        let old=tx.query_row("SELECT id,owner,title,display_time,location,starts,cancelled,source_fingerprint FROM events WHERE chat_id=?1 AND source_message_id=?2",params![chat,message_id],|r|Ok(CreatedRow{id:r.get(0)?,owner:r.get(1)?,title:r.get(2)?,display_time:r.get(3)?,location:r.get(4)?,starts:r.get(5)?,cancelled:r.get(6)?,fingerprint:r.get(7)?})).optional()?;
-        if let Some(old)=old {
-            if old.owner!=user || old.fingerprint.as_slice()!=fingerprint { return Ok(CommandOutcome::Reply(words(ru,"This message already belongs to another create request. Check /list.","Это сообщение уже относится к другой заявке. Проверьте /list.").into())); }
-            return creation_outcome(&old,ru,true);
+        match self {
+            Self::Ignored => "",
+            Self::Reply(text) | Self::Created { text, .. } => text,
         }
     }
-    let fields:Vec<_>=args.split('|').map(str::trim).collect();
-    if !(3..=4).contains(&fields.len()) || fields[0].is_empty() || fields[0].chars().count()>120 || fields.get(3).is_some_and(|s|s.chars().count()>200) {
-        return Ok(CommandOutcome::Reply(words(ru,"Use /create title | date with offset | capacity","Формат: /create название | дата со смещением | количество мест").into()));
+    pub fn created(&self) -> Option<(i64, bool)> {
+        match self {
+            Self::Created { event_id, ru, .. } => Some((*event_id, *ru)),
+            _ => None,
+        }
     }
-    let date=match DateTime::parse_from_rfc3339(fields[1]) {Ok(date) if date.timestamp()>Utc::now().timestamp()=>date,_=>return Ok(CommandOutcome::Reply(words(ru,"Enter a future RFC 3339 date with offset.","Укажите будущую RFC 3339 дату со смещением.").into()))};
-    let capacity:i64=match fields[2].parse(){Ok(n) if (1..=1000).contains(&n)=>n,_=>return Ok(CommandOutcome::Reply(words(ru,"Capacity must be between 1 and 1000.","Количество мест: от 1 до 1000.").into()))};
-    let location=fields.get(3).copied().unwrap_or("");
-    let display_time=date.to_rfc3339();
+}
+pub fn valid_input(text: &str) -> bool {
+    text.encode_utf16().take(4097).count() <= 4096
+}
+fn command_parts(text: &str) -> (&str, &str) {
+    let mut parts = text.trim().splitn(2, char::is_whitespace);
+    (
+        parts.next().unwrap_or("").split('@').next().unwrap_or(""),
+        parts.next().unwrap_or("").trim(),
+    )
+}
+pub fn execute(
+    db: &mut Connection,
+    chat: i64,
+    user: i64,
+    name: &str,
+    text: &str,
+) -> Result<CommandOutcome> {
+    execute_message(db, chat, user, name, text, None)
+}
+pub fn execute_message(
+    db: &mut Connection,
+    chat: i64,
+    user: i64,
+    name: &str,
+    text: &str,
+    message_id: Option<i32>,
+) -> Result<CommandOutcome> {
+    if !valid_input(text) {
+        return Ok(CommandOutcome::Reply(
+            "Command is too long / Слишком длинная команда".into(),
+        ));
+    }
+    if text.trim().is_empty() {
+        return Ok(CommandOutcome::Ignored);
+    }
+    if user <= 0 {
+        return Ok(CommandOutcome::Reply(
+            "Sender unavailable / Отправитель недоступен".into(),
+        ));
+    }
+    let (command, args) = command_parts(text);
+    if command == "/create" {
+        let ru = language(db, chat)? == "ru";
+        let fingerprint = Sha256::digest(text.trim().as_bytes()).to_vec();
+        return create(db, chat, user, args, message_id, &fingerprint, ru);
+    }
+    let bounded_name = name.chars().take(60).collect::<String>();
+    let reply = execute_text(db, chat, user, &bounded_name, text)?;
+    Ok(if reply.is_empty() {
+        CommandOutcome::Ignored
+    } else {
+        CommandOutcome::Reply(reply)
+    })
+}
+struct CreatedRow {
+    id: i64,
+    owner: i64,
+    title: String,
+    display_time: String,
+    location: String,
+    starts: i64,
+    cancelled: bool,
+    fingerprint: Vec<u8>,
+}
+fn creation_outcome(row: &CreatedRow, ru: bool, replayed: bool) -> Result<CommandOutcome> {
+    if replayed && (row.cancelled || row.starts <= Utc::now().timestamp()) {
+        return Ok(CommandOutcome::Reply(format!(
+            "{} #{}; {}",
+            words(ru, "Already created", "Уже создана встреча"),
+            row.id,
+            words(
+                ru,
+                "this event is no longer open.",
+                "эта встреча больше не открыта."
+            )
+        )));
+    }
+    let date =
+        DateTime::parse_from_rfc3339(&row.display_time).context("Invalid saved creation time")?;
+    let heading = if replayed {
+        words(ru, "Already created", "Уже создана встреча")
+    } else {
+        words(ru, "Created", "Создана встреча")
+    };
+    Ok(CommandOutcome::Created {
+        event_id: row.id,
+        ru,
+        text: format!(
+            "{} #{}: {}\n{}{}\n/join {} · /people {}",
+            heading,
+            row.id,
+            row.title,
+            date.format("%Y-%m-%d %H:%M %:z"),
+            if row.location.is_empty() {
+                String::new()
+            } else {
+                format!("\n📍 {}", row.location)
+            },
+            row.id,
+            row.id
+        ),
+    })
+}
+fn create(
+    db: &mut Connection,
+    chat: i64,
+    user: i64,
+    args: &str,
+    message_id: Option<i32>,
+    fingerprint: &[u8],
+    ru: bool,
+) -> Result<CommandOutcome> {
+    if message_id.is_some_and(|id| id <= 0) {
+        return Ok(CommandOutcome::Reply(
+            "Message identifier unavailable / Номер сообщения недоступен".into(),
+        ));
+    }
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if let Some(message_id) = message_id {
+        let old=tx.query_row("SELECT id,owner,title,display_time,location,starts,cancelled,source_fingerprint FROM events WHERE chat_id=?1 AND source_message_id=?2",params![chat,message_id],|r|Ok(CreatedRow{id:r.get(0)?,owner:r.get(1)?,title:r.get(2)?,display_time:r.get(3)?,location:r.get(4)?,starts:r.get(5)?,cancelled:r.get(6)?,fingerprint:r.get(7)?})).optional()?;
+        if let Some(old) = old {
+            if old.owner != user || old.fingerprint.as_slice() != fingerprint {
+                return Ok(CommandOutcome::Reply(
+                    words(
+                        ru,
+                        "This message already belongs to another create request. Check /list.",
+                        "Это сообщение уже относится к другой заявке. Проверьте /list.",
+                    )
+                    .into(),
+                ));
+            }
+            return creation_outcome(&old, ru, true);
+        }
+    }
+    let fields: Vec<_> = args.split('|').map(str::trim).collect();
+    if !(3..=4).contains(&fields.len())
+        || fields[0].is_empty()
+        || fields[0].chars().count() > 120
+        || fields.get(3).is_some_and(|s| s.chars().count() > 200)
+    {
+        return Ok(CommandOutcome::Reply(
+            words(
+                ru,
+                "Use /create title | date with offset | capacity",
+                "Формат: /create название | дата со смещением | количество мест",
+            )
+            .into(),
+        ));
+    }
+    let date = match DateTime::parse_from_rfc3339(fields[1]) {
+        Ok(date) if date.timestamp() > Utc::now().timestamp() => date,
+        _ => {
+            return Ok(CommandOutcome::Reply(
+                words(
+                    ru,
+                    "Enter a future RFC 3339 date with offset.",
+                    "Укажите будущую RFC 3339 дату со смещением.",
+                )
+                .into(),
+            ))
+        }
+    };
+    let capacity: i64 = match fields[2].parse() {
+        Ok(n) if (1..=1000).contains(&n) => n,
+        _ => {
+            return Ok(CommandOutcome::Reply(
+                words(
+                    ru,
+                    "Capacity must be between 1 and 1000.",
+                    "Количество мест: от 1 до 1000.",
+                )
+                .into(),
+            ))
+        }
+    };
+    let location = fields.get(3).copied().unwrap_or("");
+    let display_time = date.to_rfc3339();
     let id=tx.query_row("INSERT INTO events(chat_id,owner,title,starts,capacity,location,display_time,source_message_id,source_fingerprint) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9) RETURNING id",params![chat,user,fields[0],date.timestamp(),capacity,location,display_time,message_id,fingerprint],|r|r.get(0))?;
     tx.commit()?;
-    creation_outcome(&CreatedRow{id,owner:user,title:fields[0].into(),display_time,location:location.into(),starts:date.timestamp(),cancelled:false,fingerprint:fingerprint.to_vec()},ru,false)
+    creation_outcome(
+        &CreatedRow {
+            id,
+            owner: user,
+            title: fields[0].into(),
+            display_time,
+            location: location.into(),
+            starts: date.timestamp(),
+            cancelled: false,
+            fingerprint: fingerprint.to_vec(),
+        },
+        ru,
+        false,
+    )
 }
 
 pub fn language(db: &Connection, chat: i64) -> Result<String> {
-    Ok(db.query_row("SELECT lang FROM chats WHERE chat_id=?1", [chat], |r| r.get(0)).optional()?.unwrap_or_else(|| "en".into()))
+    Ok(db
+        .query_row("SELECT lang FROM chats WHERE chat_id=?1", [chat], |r| {
+            r.get(0)
+        })
+        .optional()?
+        .unwrap_or_else(|| "en".into()))
 }
-pub fn words(ru: bool, en: &'static str, russian: &'static str) -> &'static str { if ru { russian } else { en } }
-fn execute_text(db: &mut Connection, chat: i64, user: i64, name: &str, text: &str) -> Result<String> {
+pub fn words(ru: bool, en: &'static str, russian: &'static str) -> &'static str {
+    if ru {
+        russian
+    } else {
+        en
+    }
+}
+fn execute_text(
+    db: &mut Connection,
+    chat: i64,
+    user: i64,
+    name: &str,
+    text: &str,
+) -> Result<String> {
     let ru = language(db, chat)? == "ru";
     let (command, args) = command_parts(text);
     match command {
@@ -138,85 +303,198 @@ fn execute_text(db: &mut Connection, chat: i64, user: i64, name: &str, text: &st
 mod tests {
     use super::*;
     use crate::init_db;
-    fn request() -> String { format!("/create Dinner | {} | 2 | Cafe",(Utc::now()+chrono::Duration::days(2)).to_rfc3339()) }
+    fn request() -> String {
+        format!(
+            "/create Dinner | {} | 2 | Cafe",
+            (Utc::now() + chrono::Duration::days(2)).to_rfc3339()
+        )
+    }
     #[test]
     fn unrelated_insert_cannot_turn_rejection_into_created_metadata() -> Result<()> {
-        let shared=init_db(":memory:")?;let mut db=shared.lock().map_err(|_|anyhow::anyhow!("lock"))?;
-        let before:i64=db.query_row("SELECT COALESCE(MAX(id),0) FROM events",[],|r|r.get(0))?;
-        assert_ne!(db.last_insert_rowid(),before); // Reproduces the old transport predicate after app_meta insertion.
-        let rejected=execute_message(&mut db,1,11,"Name","/create invalid",Some(7))?;
-        assert!(matches!(&rejected,CommandOutcome::Reply(_)) && rejected.created().is_none());
-        db.execute("INSERT INTO chats(chat_id,lang) VALUES(999,'en')",[])?;
-        assert_eq!(db.last_insert_rowid(),999);
-        assert!(execute_message(&mut db,1,11,"Name","/create invalid",Some(8))?.created().is_none());
-        assert_eq!(execute(&mut db,1,11,"Name","")?,CommandOutcome::Ignored);
-        assert_eq!(db.query_row("SELECT count(*) FROM events",[],|r|r.get::<_,i64>(0))?,0);
+        let shared = init_db(":memory:")?;
+        let mut db = shared.lock().map_err(|_| anyhow::anyhow!("lock"))?;
+        let before: i64 =
+            db.query_row("SELECT COALESCE(MAX(id),0) FROM events", [], |r| r.get(0))?;
+        assert_ne!(db.last_insert_rowid(), before); // Reproduces the old transport predicate after app_meta insertion.
+        let rejected = execute_message(&mut db, 1, 11, "Name", "/create invalid", Some(7))?;
+        assert!(matches!(&rejected, CommandOutcome::Reply(_)) && rejected.created().is_none());
+        db.execute("INSERT INTO chats(chat_id,lang) VALUES(999,'en')", [])?;
+        assert_eq!(db.last_insert_rowid(), 999);
+        assert!(
+            execute_message(&mut db, 1, 11, "Name", "/create invalid", Some(8))?
+                .created()
+                .is_none()
+        );
+        assert_eq!(
+            execute(&mut db, 1, 11, "Name", "")?,
+            CommandOutcome::Ignored
+        );
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM events", [], |r| r.get::<_, i64>(0))?,
+            0
+        );
         Ok(())
     }
     #[test]
     fn creation_metadata_comes_from_the_insert_even_with_another_trigger_insert() -> Result<()> {
-        let shared=init_db(":memory:")?;let mut db=shared.lock().map_err(|_|anyhow::anyhow!("lock"))?;
+        let shared = init_db(":memory:")?;
+        let mut db = shared.lock().map_err(|_| anyhow::anyhow!("lock"))?;
         db.execute_batch("CREATE TABLE audit(id INTEGER PRIMARY KEY,value TEXT); CREATE TRIGGER audit_event AFTER INSERT ON events BEGIN INSERT INTO audit(id,value) VALUES(1000+new.id,'fixture'); END;")?;
-        let outcome=execute_message(&mut db,1,11,"Name",&request(),Some(10))?;
-        let (id,ru)=outcome.created().context("created")?;
-        assert_eq!(id,1);assert!(!ru);assert!(outcome.text().contains("#1"));
-        assert_eq!(db.query_row("SELECT id FROM audit",[],|r|r.get::<_,i64>(0))?,1001);
+        let outcome = execute_message(&mut db, 1, 11, "Name", &request(), Some(10))?;
+        let (id, ru) = outcome.created().context("created")?;
+        assert_eq!(id, 1);
+        assert!(!ru);
+        assert!(outcome.text().contains("#1"));
+        assert_eq!(
+            db.query_row("SELECT id FROM audit", [], |r| r.get::<_, i64>(0))?,
+            1001
+        );
         Ok(())
     }
     #[test]
     fn failed_creation_leaves_no_receipt_and_the_same_request_can_retry() -> Result<()> {
-        let shared=init_db(":memory:")?;let mut db=shared.lock().map_err(|_|anyhow::anyhow!("lock"))?;
+        let shared = init_db(":memory:")?;
+        let mut db = shared.lock().map_err(|_| anyhow::anyhow!("lock"))?;
         db.execute_batch("CREATE TRIGGER reject_create BEFORE INSERT ON events BEGIN SELECT RAISE(ABORT,'private fixture'); END;")?;
-        let text=request();assert!(execute_message(&mut db,1,11,"Name",&text,Some(11)).is_err());
-        assert_eq!(db.query_row("SELECT count(*) FROM events",[],|r|r.get::<_,i64>(0))?,0);
-        db.execute("DROP TRIGGER reject_create",[])?;
-        assert!(execute_message(&mut db,1,11,"Name",&text,Some(11))?.created().is_some());
+        let text = request();
+        assert!(execute_message(&mut db, 1, 11, "Name", &text, Some(11)).is_err());
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM events", [], |r| r.get::<_, i64>(0))?,
+            0
+        );
+        db.execute("DROP TRIGGER reject_create", [])?;
+        assert!(execute_message(&mut db, 1, 11, "Name", &text, Some(11))?
+            .created()
+            .is_some());
         Ok(())
     }
     #[test]
     fn replay_survives_reopen_and_rejects_changed_owner_or_payload() -> Result<()> {
-        let temp=tempfile::tempdir()?;let path=temp.path().join("gather.sqlite");let file=path.to_string_lossy();let text=request();
-        let id={let shared=init_db(&file)?;let mut db=shared.lock().map_err(|_|anyhow::anyhow!("lock"))?;execute_message(&mut db,1,11,"Name",&text,Some(12))?.created().context("created")?.0};
-        let shared=init_db(&file)?;let mut db=shared.lock().map_err(|_|anyhow::anyhow!("lock"))?;
-        assert_eq!(execute_message(&mut db,1,11,"Name",&text,Some(12))?.created().context("replayed")?.0,id);
-        assert!(execute_message(&mut db,1,12,"Other",&text,Some(12))?.created().is_none());
-        assert!(execute_message(&mut db,1,11,"Name",&text.replace("Dinner","Changed"),Some(12))?.created().is_none());
-        assert!(execute_message(&mut db,2,11,"Name",&text,Some(12))?.created().is_some());
-        execute(&mut db,1,11,"Name",&format!("/cancel {id}"))?;
-        assert!(execute_message(&mut db,1,11,"Name",&text,Some(12))?.created().is_none());
-        assert_eq!(db.query_row("SELECT count(*) FROM events",[],|r|r.get::<_,i64>(0))?,2);
-        assert_eq!(db.query_row("SELECT cancelled FROM events WHERE id=?1",[id],|r|r.get::<_,i64>(0))?,1);
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("gather.sqlite");
+        let file = path.to_string_lossy();
+        let text = request();
+        let id = {
+            let shared = init_db(&file)?;
+            let mut db = shared.lock().map_err(|_| anyhow::anyhow!("lock"))?;
+            execute_message(&mut db, 1, 11, "Name", &text, Some(12))?
+                .created()
+                .context("created")?
+                .0
+        };
+        let shared = init_db(&file)?;
+        let mut db = shared.lock().map_err(|_| anyhow::anyhow!("lock"))?;
+        assert_eq!(
+            execute_message(&mut db, 1, 11, "Name", &text, Some(12))?
+                .created()
+                .context("replayed")?
+                .0,
+            id
+        );
+        assert!(execute_message(&mut db, 1, 12, "Other", &text, Some(12))?
+            .created()
+            .is_none());
+        assert!(execute_message(
+            &mut db,
+            1,
+            11,
+            "Name",
+            &text.replace("Dinner", "Changed"),
+            Some(12)
+        )?
+        .created()
+        .is_none());
+        assert!(execute_message(&mut db, 2, 11, "Name", &text, Some(12))?
+            .created()
+            .is_some());
+        execute(&mut db, 1, 11, "Name", &format!("/cancel {id}"))?;
+        assert!(execute_message(&mut db, 1, 11, "Name", &text, Some(12))?
+            .created()
+            .is_none());
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM events", [], |r| r.get::<_, i64>(0))?,
+            2
+        );
+        assert_eq!(
+            db.query_row("SELECT cancelled FROM events WHERE id=?1", [id], |r| r
+                .get::<_, i64>(0))?,
+            1
+        );
         Ok(())
     }
     #[test]
     fn command_input_and_locale_are_explicit() -> Result<()> {
-        let shared=init_db(":memory:")?;let mut db=shared.lock().map_err(|_|anyhow::anyhow!("lock"))?;
+        let shared = init_db(":memory:")?;
+        let mut db = shared.lock().map_err(|_| anyhow::anyhow!("lock"))?;
         assert!(!valid_input(&"🦀".repeat(2049)));
-        assert!(execute(&mut db,1,11,"Name",&"🦀".repeat(2049))?.created().is_none());
-        execute(&mut db,1,11,"Name","/lang ru")?;
-        let text=request().replace("/create ","/create@TestBot\t");
-        let result=execute_message(&mut db,1,11,"Name",&text,Some(13))?;
+        assert!(execute(&mut db, 1, 11, "Name", &"🦀".repeat(2049))?
+            .created()
+            .is_none());
+        execute(&mut db, 1, 11, "Name", "/lang ru")?;
+        let text = request().replace("/create ", "/create@TestBot\t");
+        let result = execute_message(&mut db, 1, 11, "Name", &text, Some(13))?;
         assert!(result.created().context("created")?.1);
         assert!(result.text().contains("Создана встреча"));
-        assert!(execute_message(&mut db,1,11,"Name",&request(),Some(0))?.created().is_none());
+        assert!(
+            execute_message(&mut db, 1, 11, "Name", &request(), Some(0))?
+                .created()
+                .is_none()
+        );
         Ok(())
     }
     #[test]
     fn concurrent_connections_replay_one_creation() -> Result<()> {
-        let temp=tempfile::tempdir()?;let path=temp.path().join("gather.sqlite");drop(init_db(&path.to_string_lossy())?);
-        let barrier=std::sync::Arc::new(std::sync::Barrier::new(2));let text=request();let mut handles=Vec::new();
-        for _ in 0..2 {let path=path.clone();let barrier=barrier.clone();let text=text.clone();handles.push(std::thread::spawn(move || -> Result<i64> {let mut db=Connection::open(path)?;db.busy_timeout(std::time::Duration::from_secs(2))?;barrier.wait();Ok(execute_message(&mut db,1,11,"Name",&text,Some(14))?.created().context("created")?.0)}));}
-        let ids=handles.into_iter().map(|h|h.join().map_err(|_|anyhow::anyhow!("thread"))?).collect::<Result<Vec<_>>>()?;
-        assert_eq!(ids[0],ids[1]);let db=Connection::open(path)?;assert_eq!(db.query_row("SELECT count(*) FROM events",[],|r|r.get::<_,i64>(0))?,1);
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("gather.sqlite");
+        drop(init_db(&path.to_string_lossy())?);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let text = request();
+        let mut handles = Vec::new();
+        for _ in 0..2 {
+            let path = path.clone();
+            let barrier = barrier.clone();
+            let text = text.clone();
+            handles.push(std::thread::spawn(move || -> Result<i64> {
+                let mut db = Connection::open(path)?;
+                db.busy_timeout(std::time::Duration::from_secs(2))?;
+                barrier.wait();
+                Ok(execute_message(&mut db, 1, 11, "Name", &text, Some(14))?
+                    .created()
+                    .context("created")?
+                    .0)
+            }));
+        }
+        let ids = handles
+            .into_iter()
+            .map(|h| h.join().map_err(|_| anyhow::anyhow!("thread"))?)
+            .collect::<Result<Vec<_>>>()?;
+        assert_eq!(ids[0], ids[1]);
+        let db = Connection::open(path)?;
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM events", [], |r| r.get::<_, i64>(0))?,
+            1
+        );
         Ok(())
     }
     #[test]
     fn existing_event_migration_preserves_data_without_inventing_a_source_message() -> Result<()> {
-        let temp=tempfile::tempdir()?;let path=temp.path().join("legacy.sqlite");
-        {let db=Connection::open(&path)?;db.execute_batch("CREATE TABLE events(id INTEGER PRIMARY KEY,chat_id INTEGER NOT NULL,owner INTEGER NOT NULL,title TEXT NOT NULL,starts INTEGER NOT NULL,capacity INTEGER NOT NULL,cancelled INTEGER NOT NULL DEFAULT 0,reminded INTEGER NOT NULL DEFAULT 0); INSERT INTO events VALUES(1,1,11,'legacy',2000000000,2,0,0);")?;}
-        let shared=init_db(&path.to_string_lossy())?;let db=shared.lock().map_err(|_|anyhow::anyhow!("lock"))?;
-        assert_eq!(db.query_row("SELECT title FROM events WHERE id=1",[],|r|r.get::<_,String>(0))?,"legacy");
-        assert!(db.query_row("SELECT source_message_id FROM events WHERE id=1",[],|r|r.get::<_,Option<i32>>(0))?.is_none());
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("legacy.sqlite");
+        {
+            let db = Connection::open(&path)?;
+            db.execute_batch("CREATE TABLE events(id INTEGER PRIMARY KEY,chat_id INTEGER NOT NULL,owner INTEGER NOT NULL,title TEXT NOT NULL,starts INTEGER NOT NULL,capacity INTEGER NOT NULL,cancelled INTEGER NOT NULL DEFAULT 0,reminded INTEGER NOT NULL DEFAULT 0); INSERT INTO events VALUES(1,1,11,'legacy',2000000000,2,0,0);")?;
+        }
+        let shared = init_db(&path.to_string_lossy())?;
+        let db = shared.lock().map_err(|_| anyhow::anyhow!("lock"))?;
+        assert_eq!(
+            db.query_row("SELECT title FROM events WHERE id=1", [], |r| r
+                .get::<_, String>(0))?,
+            "legacy"
+        );
+        assert!(db
+            .query_row("SELECT source_message_id FROM events WHERE id=1", [], |r| r
+                .get::<_, Option<i32>>(0))?
+            .is_none());
         Ok(())
     }
 }
