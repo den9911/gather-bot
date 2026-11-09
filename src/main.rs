@@ -1,10 +1,10 @@
 mod calendar;
 mod commands;
 mod diagnostics;
-#[cfg(test)]
-mod transport_tests;
 mod replies;
 mod startup;
+#[cfg(test)]
+mod transport_tests;
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use commands::{execute, execute_message, language, words};
@@ -77,7 +77,10 @@ async fn reminders(bot: Bot, db: Db) {
             );
             if bot.send_message(ChatId(chat), msg).await.is_ok() {
                 if let Ok(conn) = db.lock() {
-                    if conn.execute("UPDATE events SET reminded=1 WHERE id=?1", [id]).is_err() {
+                    if conn
+                        .execute("UPDATE events SET reminded=1 WHERE id=?1", [id])
+                        .is_err()
+                    {
                         report(Diagnostic::ReminderUpdate);
                     }
                 }
@@ -250,7 +253,9 @@ async fn main() -> Result<()> {
         .branch(Update::filter_callback_query().endpoint(callback_handler));
     Dispatcher::builder(bot, handler)
         .dependencies(teloxide::dptree::deps![db])
-        .error_handler(Arc::new(|_: teloxide::RequestError| async { report(Diagnostic::Transport); }))
+        .error_handler(Arc::new(|_: teloxide::RequestError| async {
+            report(Diagnostic::Transport);
+        }))
         .enable_ctrlc_handler()
         .build()
         .dispatch()
