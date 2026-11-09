@@ -1,10 +1,14 @@
 mod calendar;
 mod commands;
+mod diagnostics;
+#[cfg(test)]
+mod transport_tests;
 mod replies;
 mod startup;
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use commands::{execute, execute_message, language, words};
+use diagnostics::{report, Diagnostic};
 use rusqlite::{params, Connection};
 use std::{
     env,
@@ -55,7 +59,7 @@ async fn reminders(bot: Bot, db: Db) {
         let pending: Vec<(i64,i64,String)> = match db.lock() {
             Ok(conn) => match conn.prepare("SELECT id,chat_id,title FROM events WHERE cancelled=0 AND reminded=0 AND starts>?1 AND starts<=?2 LIMIT 50") {
                 Ok(mut stmt)=>stmt.query_map(params![Utc::now().timestamp(),Utc::now().timestamp()+3600],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).ok().map(|rows|rows.filter_map(|r|r.ok()).collect()).unwrap_or_default(),
-                Err(e)=>{eprintln!("reminder query: {e}");Vec::new()}
+                Err(_)=>{report(Diagnostic::ReminderQuery);Vec::new()}
             }, Err(_)=>Vec::new()
         };
         for (id, chat, title) in pending {
@@ -73,8 +77,8 @@ async fn reminders(bot: Bot, db: Db) {
             );
             if bot.send_message(ChatId(chat), msg).await.is_ok() {
                 if let Ok(conn) = db.lock() {
-                    if let Err(e) = conn.execute("UPDATE events SET reminded=1 WHERE id=?1", [id]) {
-                        eprintln!("reminder update: {e}");
+                    if conn.execute("UPDATE events SET reminded=1 WHERE id=?1", [id]).is_err() {
+                        report(Diagnostic::ReminderUpdate);
                     }
                 }
             }
@@ -164,10 +168,10 @@ async fn message_handler(bot: Bot, msg: Message, db: Db) -> ResponseResult<()> {
             }
         }
         Err(_) => {
-            eprintln!("Command processing failed");
+            report(Diagnostic::Command);
             bot.send_message(
                 msg.chat.id,
-                "Could not process this request. / Не удалось выполнить запрос.",
+                "Request not confirmed. Check /list before a new /create. / Запрос не подтверждён. Перед новой /create проверьте /list.",
             )
             .await?;
         }
@@ -200,7 +204,7 @@ async fn callback_handler(bot: Bot, q: CallbackQuery, db: Db) -> ResponseResult<
                     }
                     Ok(outcome) => outcome.text().to_owned(),
                     Err(_) => {
-                        eprintln!("Callback processing failed");
+                        report(Diagnostic::Callback);
                         "Request failed / Ошибка запроса".into()
                     }
                 }
@@ -209,7 +213,7 @@ async fn callback_handler(bot: Bot, q: CallbackQuery, db: Db) -> ResponseResult<
             "Invalid action / Неверное действие".into()
         }
     } else {
-        "Message unavailable / Сообщение недоступно".into()
+        "Message unavailable. Use /list. / Сообщение недоступно. /list".into()
     };
     bot.answer_callback_query(q.id)
         .text(replies::short(&answer))
@@ -246,6 +250,7 @@ async fn main() -> Result<()> {
         .branch(Update::filter_callback_query().endpoint(callback_handler));
     Dispatcher::builder(bot, handler)
         .dependencies(teloxide::dptree::deps![db])
+        .error_handler(Arc::new(|_: teloxide::RequestError| async { report(Diagnostic::Transport); }))
         .enable_ctrlc_handler()
         .build()
         .dispatch()

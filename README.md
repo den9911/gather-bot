@@ -57,3 +57,9 @@ ID и кнопки появляются только в результате у�
 Long replies are split within a 3500 UTF-16-unit budget, up to four parts; extreme legacy data is explicitly marked as truncated. The People button opens a short acknowledgement followed by the full bounded reply. Input commands are limited to 4096 UTF-16 units and callbacks to 64 bytes. Telegram supplies its own appearance; no separate web theme controls are invented.
 
 Длинные ответы разбиваются на части до 3500 UTF-16 единиц, максимум четыре; чрезмерный старый результат помечается как сокращённый. Кнопка «Участники» даёт короткое подтверждение и полный ограниченный ответ отдельными сообщениями. Команда ограничена 4096 UTF-16 единицами, callback — 64 байтами. Оформлением управляет Telegram.
+
+### Recovery / Восстановление
+
+A lost Telegram reply does not undo a committed event. Check `/list` before sending a new `/create`; the original message can be redelivered safely. Application diagnostics use five fixed warning categories, at most once each per process, rather than printing request payloads or raw command errors. A missing callback message asks for a fresh `/list`.
+
+Потеря ответа Telegram не отменяет сохранённую встречу. Перед новой `/create` проверьте `/list`; повторная доставка исходного сообщения безопасна. Приложение печатает фиксированные предупреждения пяти категорий, не чаще одного раза на категорию за процесс. Недоступное сообщение кнопки предлагает обновить `/list`.
